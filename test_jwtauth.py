@@ -8,7 +8,7 @@ This stage Implementing:
 - Protected endpoints (routes that require authentication)
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from passlib.context import CryptContext
@@ -88,7 +88,8 @@ class LoginRequest(BaseModel):
 
 # For learning, we'll store users in memory (lost when app restarts)
 fake_users_db = {}
-
+access_blacklist = {}
+refresh_blacklist = {}
 # ============================================================================
 # HELPER FUNCTIONS - Reusable code
 # ============================================================================
@@ -122,10 +123,13 @@ def create_access_token(username: str) -> str:
     Format: xxxxx.yyyyy.zzzzz (header.payload.signature)
     """
     # Data to put in the token
+    jti = uuid.uuid4().hex
     payload = {
+    
         "sub": username,  # "sub" is standard for "subject" (who this token is for)
         "exp": datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
-        "iat": datetime.utcnow()  # "iat" = issued at
+        "iat": datetime.utcnow(),  # "iat" = issued at
+        "jti": jti
     }
     
     # Sign the token with our secret key
@@ -143,10 +147,11 @@ def verify_token(token: str) -> Optional[str]:
         # Decode and verify the token
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
-        
+        jti: str = payload.get("jti")
         if username is None:
             return None
-            
+        if jti in access_blacklist:
+            return None          
         return username
         
     except JWTError:
@@ -198,7 +203,7 @@ def verify_refresh_token(token: str) -> Optional[str]:
             return None
         if username not in fake_users_db:
             return None
-        if jti != fake_users_db[username]['refresh_token'].get("jti"):
+        if jti != fake_users_db[username]['refresh_token'].get('jti'):
             return None
             
         return username,jti
@@ -368,6 +373,24 @@ async def refresh(token: Token):
 
     return Token(access_token=access_token, refresh_token=token.refresh_token, token_type="bearer")
 
+
+@app.post("/logout")
+async def logout(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    username = verify_token(token)
+    if username is None:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        jti: str = payload.get("jti")
+        exp: str = payload.get("exp")
+        access_blacklist[jti] = exp
+        fake_users_db[username]['refresh_token'] = {}
+    except JWTError:
+        # Token is invalid, expired, or tampered with
+        return None
+    
+    return Response(status_code=status.HTTP_200_OK) 
 
 
 
