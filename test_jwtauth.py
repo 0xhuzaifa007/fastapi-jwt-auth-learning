@@ -15,7 +15,8 @@ from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from jose import jwt, JWTError
 from typing import Optional
-
+import time
+import uuid
 # ============================================================================
 # CONFIGURATION - Settings for our app
 # ============================================================================
@@ -25,9 +26,10 @@ from typing import Optional
 # - Stored in environment variables (never in code!)
 # - Never shared or committed to git
 SECRET_KEY = "mcpauth2.0"
+SECRET_KEY2 = "refreshtoken"
 ALGORITHM = "HS256"  # The algorithm to sign tokens
 ACCESS_TOKEN_EXPIRE_MINUTES = 1  # Tokens expire after 30 minutes
-
+REFRESH_TOKEN_EXPIRE_MINUTES = 5
 # ============================================================================
 # INITIALIZE APP
 # ============================================================================
@@ -50,11 +52,14 @@ class User(BaseModel):
     username: str
     email: str
     full_name: Optional[str] = None
-    age: int
+    age: Optional[int] = None 
+    
+
 
 class UserInDB(User):
     """User as stored in database (includes hashed password)"""
     hashed_password: str
+    refresh_token: Optional[dict] = None
 
 class UserCreate(BaseModel):
     """Data needed to create a new user"""
@@ -62,13 +67,16 @@ class UserCreate(BaseModel):
     email: str
     password: str
     full_name: Optional[str] = None
-    age: int
+    age: Optional[int] = None
 
 class Token(BaseModel):
     """What we return when someone logs in"""
     access_token: str
+    refresh_token: str
     token_type: str
-
+# class RToken(BaseModel):
+#     refresh_token: str
+#     token_type: str
 class LoginRequest(BaseModel):
     """Data needed to log in"""
     username: str
@@ -124,6 +132,7 @@ def create_access_token(username: str) -> str:
     token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
     return token
 
+
 def verify_token(token: str) -> Optional[str]:
     """
     Verify a token and extract the username
@@ -139,6 +148,60 @@ def verify_token(token: str) -> Optional[str]:
             return None
             
         return username
+        
+    except JWTError:
+        # Token is invalid, expired, or tampered with
+        return None
+
+def create_refresh_token(username: str) -> str:
+    """
+    Create a JWT (JSON Web Token)
+    
+    A JWT contains:
+    1. Header: Type of token and algorithm
+    2. Payload: The data (username, expiration time)
+    3. Signature: Proof it hasn't been tampered with
+    
+    Format: xxxxx.yyyyy.zzzzz (header.payload.signature)
+    """
+    # Data to put in the token
+    uid = uuid.uuid4().hex
+    payload = {
+        "sub": username,  # "sub" is standard for "subject" (who this token is for)
+        "exp": datetime.utcnow() + timedelta(minutes=REFRESH_TOKEN_EXPIRE_MINUTES),
+        "iat": datetime.utcnow(),  # "iat" = issued at
+        "jti": uid # token identifier
+    }
+    if username not in fake_users_db:
+        return None
+    fake_users_db[username]['refresh_token'] = {
+        "jti": uid,
+        "exp": payload.get("exp")
+    }
+    # Sign the token with our secret key
+    rtoken = jwt.encode(payload, SECRET_KEY2, algorithm=ALGORITHM)
+    return rtoken
+
+def verify_refresh_token(token: str) -> Optional[str]:
+    """
+    Verify a token and extract the username
+    
+    Returns username if valid, None if invalid/expired
+    """
+    try:
+        # Decode and verify the token
+        payload = jwt.decode(token, SECRET_KEY2, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        jti: str = payload.get("jti")
+        
+        if username is None:
+            return None
+        if username not in fake_users_db:
+            return None
+        if jti != fake_users_db[username]['refresh_token'].get("jti"):
+            return None
+            
+        return username,jti
         
     except JWTError:
         # Token is invalid, expired, or tampered with
@@ -278,8 +341,35 @@ async def login(login_data: LoginRequest):
     
     # Create access token
     access_token = create_access_token(user.username)
+    refresh_token = create_refresh_token(user.username)
     
-    return Token(access_token=access_token, token_type="bearer")
+    
+    
+    return Token(access_token=access_token, refresh_token=refresh_token, token_type="bearer")
+
+@app.post("/refresh")
+async def refresh(token: Token):
+    res = verify_refresh_token(token.refresh_token)
+    if res is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh Token Expired or Invalid",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    else:
+        username,jti = res
+    if username is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh Token Expired or Invalid",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token = create_access_token(username)
+
+    return Token(access_token=access_token, refresh_token=token.refresh_token, token_type="bearer")
+
+
+
 
 @app.get("/profile", response_model=User)
 async def get_profile(current_user: User = Depends(get_current_user)):
