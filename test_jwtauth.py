@@ -8,7 +8,7 @@ This stage Implementing:
 - Protected endpoints (routes that require authentication)
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status, Response
+from fastapi import FastAPI, HTTPException, Depends, status, Response, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from passlib.context import CryptContext
@@ -90,9 +90,39 @@ class LoginRequest(BaseModel):
 fake_users_db = {}
 access_blacklist = {}
 refresh_blacklist = {}
+_rate_limit_store = {}
 # ============================================================================
 # HELPER FUNCTIONS - Reusable code
 # ============================================================================
+def rate_limit_dependency(limit: int, window_seconds: int):
+    def inner_function(request: Request):
+        now = time.time()
+        ip = request.client.host if request.client else "unkown"
+        key = f'{ip}:{request.url.path}'
+        print(ip, request.client)
+        entry = _rate_limit_store.get(key)
+        if entry is None:
+            _rate_limit_store[key] = {"count" :1, "start": now}
+            return None
+        
+        elapsed = now - entry["start"]
+        if elapsed >= window_seconds:
+            _rate_limit_store[key] = {"count" :1, "start": now}
+            return None
+        
+        if entry["count"] < limit:
+            entry["count"] += 1
+            return None
+        
+        retry_after = window_seconds - elapsed
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many requests. Try again in {retry_after} seconds.",
+            headers={"Retry-After": str(int(retry_after))}         
+        )  
+
+    return inner_function
+
 
 def hash_password(password: str) -> str:
     """
@@ -325,7 +355,7 @@ async def register(user_data: UserCreate):
     )
 
 @app.post("/login", response_model=Token)
-async def login(login_data: LoginRequest):
+async def login(login_data: LoginRequest, _rl = Depends(rate_limit_dependency(limit = 5, window_seconds = 60))):
     """
     Login and get an access token
     
